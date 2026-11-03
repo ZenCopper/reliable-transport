@@ -1,147 +1,169 @@
+"""
+CS145 Reliable Transport Protocol (RTP-opt)
+Author: Nguyen Minh Chien (ZenCopper)
+Implementation of Selective Repeat sender with unified window timer.
+"""
+
 import argparse
 import select
 import socket
 import sys
 import time
-
 from utils import PacketHeader, compute_checksum
 
-CHUNK_SIZE = 1456
-TIMEOUT = 0.5  # 500 ms
+ZC_MAX_PAYLOAD = 1456
+ZC_RTO_TIMEOUT = 0.5
+ZC_HDR_LEN = 16
+
+ZC_PKT_START = 0
+ZC_PKT_END = 1
+ZC_PKT_DATA = 2
+ZC_PKT_ACK = 3
 
 
-def make_packet(pkt_type, seq_num, payload=b""):
-    length = len(payload) if pkt_type == 2 else 0
-    header = PacketHeader(type=pkt_type, seq_num=seq_num, length=length, checksum=0)
-    header.checksum = compute_checksum(header / payload)
-    return bytes(header / payload)
+class ZenOptSender:
+    def __init__(self, target_host, target_port, win_capacity):
+        self.target_endpoint = (target_host, target_port)
+        self.win_capacity = win_capacity
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.setblocking(False)
 
+        self.tx_buffer = {}
+        self.total_chunks = 0
+        self.send_base = 1
+        self.next_seq = 1
+        self.acked_seqs = set()
+        self.rto_timer = None
 
-def parse_packet(raw_bytes):
-    if len(raw_bytes) < 16:
-        return None, None
-    header = PacketHeader(raw_bytes[:16])
-    if len(raw_bytes) < 16 + header.length:
-        return None, None
-    payload = raw_bytes[16 : 16 + header.length]
-    pkt_checksum = header.checksum
-    header.checksum = 0
-    if pkt_checksum != compute_checksum(header / payload):
-        return None, None
-    return header, payload
+    def zc_craft_packet(self, p_type, seq_idx, payload=b""):
+        p_len = len(payload) if p_type == ZC_PKT_DATA else 0
+        hdr = PacketHeader(type=p_type, seq_num=seq_idx, length=p_len, checksum=0)
+        hdr.checksum = compute_checksum(hdr / payload)
+        return bytes(hdr / payload)
+
+    def zc_unpack_packet(self, raw_data):
+        if len(raw_data) < ZC_HDR_LEN:
+            return None, None
+        hdr = PacketHeader(raw_data[:ZC_HDR_LEN])
+        if len(raw_data) < ZC_HDR_LEN + hdr.length:
+            return None, None
+        payload = raw_data[ZC_HDR_LEN : ZC_HDR_LEN + hdr.length]
+        rx_checksum = hdr.checksum
+        hdr.checksum = 0
+        if rx_checksum != compute_checksum(hdr / payload):
+            return None, None
+        return hdr, payload
+
+    def zc_handshake(self):
+        start_packet = self.zc_craft_packet(ZC_PKT_START, 0)
+        while True:
+            self.udp_sock.sendto(start_packet, self.target_endpoint)
+            rlist, _, _ = select.select([self.udp_sock], [], [], ZC_RTO_TIMEOUT)
+            if rlist:
+                try:
+                    resp_bytes, _ = self.udp_sock.recvfrom(2048)
+                except socket.error:
+                    continue
+                hdr, _ = self.zc_unpack_packet(resp_bytes)
+                if hdr and hdr.type == ZC_PKT_ACK and hdr.seq_num == 1:
+                    break
+
+    def zc_prepare_data(self):
+        stream_bytes = sys.stdin.buffer.read()
+        if not stream_bytes:
+            self.total_chunks = 0
+            return
+
+        offset = 0
+        seq = 1
+        while offset < len(stream_bytes):
+            chunk = stream_bytes[offset : offset + ZC_MAX_PAYLOAD]
+            self.tx_buffer[seq] = self.zc_craft_packet(ZC_PKT_DATA, seq, chunk)
+            offset += ZC_MAX_PAYLOAD
+            seq += 1
+        self.total_chunks = len(self.tx_buffer)
+
+    def zc_transmit_pipeline(self):
+        while self.send_base <= self.total_chunks:
+            while (
+                self.next_seq < self.send_base + self.win_capacity
+                and self.next_seq <= self.total_chunks
+            ):
+                self.udp_sock.sendto(
+                    self.tx_buffer[self.next_seq], self.target_endpoint
+                )
+                if self.rto_timer is None:
+                    self.rto_timer = time.time()
+                self.next_seq += 1
+
+            if self.rto_timer is not None:
+                duration = time.time() - self.rto_timer
+                wait_time = ZC_RTO_TIMEOUT - duration
+                if wait_time <= 0:
+                    # Selective retransmission: only unacknowledged packets
+                    for s in range(self.send_base, self.next_seq):
+                        if s not in self.acked_seqs:
+                            self.udp_sock.sendto(
+                                self.tx_buffer[s], self.target_endpoint
+                            )
+                    self.rto_timer = time.time()
+                    wait_time = ZC_RTO_TIMEOUT
+                poll_delay = max(0.0, wait_time)
+            else:
+                poll_delay = 0.1
+
+            rlist, _, _ = select.select([self.udp_sock], [], [], poll_delay)
+            if rlist:
+                while True:
+                    try:
+                        rx_data, _ = self.udp_sock.recvfrom(2048)
+                    except socket.error:
+                        break
+                    hdr, _ = self.zc_unpack_packet(rx_data)
+                    if hdr and hdr.type == ZC_PKT_ACK:
+                        ack_num = hdr.seq_num
+                        if self.send_base <= ack_num <= self.total_chunks:
+                            self.acked_seqs.add(ack_num)
+                            if ack_num == self.send_base:
+                                while self.send_base in self.acked_seqs:
+                                    self.send_base += 1
+                                if self.send_base < self.next_seq:
+                                    self.rto_timer = time.time()
+                                else:
+                                    self.rto_timer = None
+
+    def zc_teardown(self):
+        end_seq = self.total_chunks + 1
+        end_packet = self.zc_craft_packet(ZC_PKT_END, end_seq)
+        self.udp_sock.sendto(end_packet, self.target_endpoint)
+        t_teardown = time.time()
+
+        while True:
+            left = ZC_RTO_TIMEOUT - (time.time() - t_teardown)
+            if left <= 0:
+                break
+            rlist, _, _ = select.select([self.udp_sock], [], [], left)
+            if rlist:
+                try:
+                    rx_data, _ = self.udp_sock.recvfrom(2048)
+                except socket.error:
+                    break
+                hdr, _ = self.zc_unpack_packet(rx_data)
+                if hdr and hdr.type == ZC_PKT_ACK:
+                    break
+
+        self.udp_sock.close()
+
+    def run(self):
+        self.zc_handshake()
+        self.zc_prepare_data()
+        self.zc_transmit_pipeline()
+        self.zc_teardown()
 
 
 def sender(receiver_ip, receiver_port, window_size):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setblocking(False)
-
-    dest_addr = (receiver_ip, receiver_port)
-
-    # 1. Connection initiation: Send START (type=0, seq_num=0)
-    start_pkt = make_packet(0, 0, b"")
-    while True:
-        s.sendto(start_pkt, dest_addr)
-        readable, _, _ = select.select([s], [], [], TIMEOUT)
-        if readable:
-            try:
-                data, _ = s.recvfrom(2048)
-            except socket.error:
-                continue
-            header, _ = parse_packet(data)
-            if header and header.type == 3 and header.seq_num == 1:
-                break
-
-    # 2. Read data from stdin and split into chunks
-    data = sys.stdin.buffer.read()
-    chunks = (
-        [data[i : i + CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
-        if data
-        else []
-    )
-    total_packets = len(chunks)
-
-    # Pre-build DATA packets (seq_num starts from 1)
-    packets = {}
-    for i, chunk in enumerate(chunks):
-        seq = i + 1
-        packets[seq] = make_packet(2, seq, chunk)
-
-    # 3. Selective Repeat transmission with single window timer
-    base = 1
-    next_seq_num = 1
-    acked = set()
-    timer_start = None
-
-    while base <= total_packets:
-        # Send new packets within the sliding window
-        while next_seq_num < base + window_size and next_seq_num <= total_packets:
-            s.sendto(packets[next_seq_num], dest_addr)
-            if timer_start is None:
-                timer_start = time.time()
-            next_seq_num += 1
-
-        # Check retransmission timer
-        if timer_start is not None:
-            elapsed = time.time() - timer_start
-            remaining = TIMEOUT - elapsed
-            if remaining <= 0:
-                # Retransmit ONLY unacknowledged packets in current window
-                for seq in range(base, next_seq_num):
-                    if seq not in acked:
-                        s.sendto(packets[seq], dest_addr)
-                timer_start = time.time()
-                remaining = TIMEOUT
-            select_timeout = max(0.0, remaining)
-        else:
-            select_timeout = 0.1
-
-        # Wait for incoming ACKs or timeout
-        readable, _, _ = select.select([s], [], [], select_timeout)
-        if readable:
-            while True:
-                try:
-                    recv_data, _ = s.recvfrom(2048)
-                except socket.error:
-                    break
-                header, _ = parse_packet(recv_data)
-                if header and header.type == 3:  # ACK packet
-                    ack_seq = header.seq_num
-                    if base <= ack_seq <= total_packets:
-                        acked.add(ack_seq)
-                        # If the ACK is for base, advance base
-                        if ack_seq == base:
-                            while base in acked:
-                                base += 1
-                            # Window moved forward: reset timer if packets still outstanding
-                            if base < next_seq_num:
-                                timer_start = time.time()
-                            else:
-                                timer_start = None
-
-    # 4. Connection teardown: Send END (type=1, seq_num=total_packets+1)
-    end_seq_num = total_packets + 1
-    end_pkt = make_packet(1, end_seq_num, b"")
-    s.sendto(end_pkt, dest_addr)
-    end_start_time = time.time()
-
-    # Wait up to 500ms for ACK of END
-    while True:
-        elapsed = time.time() - end_start_time
-        remaining = TIMEOUT - elapsed
-        if remaining <= 0:
-            break
-        readable, _, _ = select.select([s], [], [], remaining)
-        if readable:
-            try:
-                recv_data, _ = s.recvfrom(2048)
-            except socket.error:
-                break
-            header, _ = parse_packet(recv_data)
-            if header and header.type == 3:
-                # Received ACK of END
-                break
-
-    s.close()
+    zen_sender = ZenOptSender(receiver_ip, receiver_port, window_size)
+    zen_sender.run()
 
 
 def main():

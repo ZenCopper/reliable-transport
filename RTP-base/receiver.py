@@ -1,113 +1,125 @@
+"""
+CS145 Reliable Transport Protocol (RTP-base)
+Author: Nguyen Minh Chien (ZenCopper)
+Implementation of Cumulative ACK reliable receiver.
+"""
+
 import argparse
 import socket
 import sys
-
 from utils import PacketHeader, compute_checksum
 
+ZC_HDR_LEN = 16
+ZC_PKT_START = 0
+ZC_PKT_END = 1
+ZC_PKT_DATA = 2
+ZC_PKT_ACK = 3
 
-def make_packet(pkt_type, seq_num, payload=b""):
-    length = len(payload) if pkt_type == 2 else 0
-    header = PacketHeader(type=pkt_type, seq_num=seq_num, length=length, checksum=0)
-    header.checksum = compute_checksum(header / payload)
-    return bytes(header / payload)
 
+class ZenBaseReceiver:
+    def __init__(self, bind_ip, bind_port, win_capacity):
+        self.bind_ip = bind_ip
+        self.bind_port = bind_port
+        self.win_capacity = win_capacity
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.bind((self.bind_ip, self.bind_port))
 
-def parse_packet(raw_bytes):
-    if len(raw_bytes) < 16:
-        return None, None
-    header = PacketHeader(raw_bytes[:16])
-    if len(raw_bytes) < 16 + header.length:
-        return None, None
-    payload = raw_bytes[16 : 16 + header.length]
-    pkt_checksum = header.checksum
-    header.checksum = 0
-    if pkt_checksum != compute_checksum(header / payload):
-        return None, None
-    return header, payload
+        self.conn_active = False
+        self.remote_peer = None
+        self.rcv_next = 1
+        self.out_of_order_buf = {}
+        self.end_flag = False
+        self.end_seq_val = None
+
+    def zc_craft_packet(self, p_type, seq_idx, payload=b""):
+        p_len = len(payload) if p_type == ZC_PKT_DATA else 0
+        hdr = PacketHeader(type=p_type, seq_num=seq_idx, length=p_len, checksum=0)
+        hdr.checksum = compute_checksum(hdr / payload)
+        return bytes(hdr / payload)
+
+    def zc_unpack_packet(self, raw_data):
+        if len(raw_data) < ZC_HDR_LEN:
+            return None, None
+        hdr = PacketHeader(raw_data[:ZC_HDR_LEN])
+        if len(raw_data) < ZC_HDR_LEN + hdr.length:
+            return None, None
+        payload = raw_data[ZC_HDR_LEN : ZC_HDR_LEN + hdr.length]
+        rx_checksum = hdr.checksum
+        hdr.checksum = 0
+        if rx_checksum != compute_checksum(hdr / payload):
+            return None, None
+        return hdr, payload
+
+    def zc_listen_loop(self):
+        while True:
+            raw_pkt, peer_addr = self.udp_sock.recvfrom(2048)
+            hdr, payload = self.zc_unpack_packet(raw_pkt)
+            if hdr is None:
+                continue
+
+            if not self.conn_active:
+                if hdr.type == ZC_PKT_START:
+                    self.remote_peer = peer_addr
+                    self.conn_active = True
+                    self.rcv_next = 1
+                    self.out_of_order_buf.clear()
+                    self.end_flag = False
+                    self.end_seq_val = None
+                    ack_start = self.zc_craft_packet(ZC_PKT_ACK, 1)
+                    self.udp_sock.sendto(ack_start, self.remote_peer)
+                continue
+
+            if peer_addr != self.remote_peer or hdr.type == ZC_PKT_START:
+                continue
+
+            if hdr.type == ZC_PKT_DATA:
+                seq = hdr.seq_num
+                if seq >= self.rcv_next + self.win_capacity:
+                    continue
+
+                if seq < self.rcv_next:
+                    ack_dup = self.zc_craft_packet(ZC_PKT_ACK, self.rcv_next)
+                    self.udp_sock.sendto(ack_dup, self.remote_peer)
+                elif seq > self.rcv_next:
+                    self.out_of_order_buf[seq] = payload
+                    ack_unord = self.zc_craft_packet(ZC_PKT_ACK, self.rcv_next)
+                    self.udp_sock.sendto(ack_unord, self.remote_peer)
+                else:
+                    sys.stdout.buffer.write(payload)
+                    self.rcv_next += 1
+                    while self.rcv_next in self.out_of_order_buf:
+                        sys.stdout.buffer.write(
+                            self.out_of_order_buf.pop(self.rcv_next)
+                        )
+                        self.rcv_next += 1
+                    sys.stdout.buffer.flush()
+
+                    cum_ack = self.zc_craft_packet(ZC_PKT_ACK, self.rcv_next)
+                    self.udp_sock.sendto(cum_ack, self.remote_peer)
+
+                    if self.end_flag and self.rcv_next == self.end_seq_val:
+                        end_ack = self.zc_craft_packet(ZC_PKT_ACK, self.end_seq_val)
+                        self.udp_sock.sendto(end_ack, self.remote_peer)
+                        break
+
+            elif hdr.type == ZC_PKT_END:
+                if hdr.seq_num == self.rcv_next:
+                    end_ack = self.zc_craft_packet(ZC_PKT_ACK, hdr.seq_num)
+                    self.udp_sock.sendto(end_ack, self.remote_peer)
+                    sys.stdout.buffer.flush()
+                    break
+                elif hdr.seq_num > self.rcv_next:
+                    self.end_flag = True
+                    self.end_seq_val = hdr.seq_num
+                    ack_pkt = self.zc_craft_packet(ZC_PKT_ACK, self.rcv_next)
+                    self.udp_sock.sendto(ack_pkt, self.remote_peer)
+
+        self.udp_sock.close()
 
 
 def receiver(receiver_ip, receiver_port, window_size):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind((receiver_ip, receiver_port))
-
-    state = "LISTENING"
-    sender_addr = None
-    expected_seq_num = 1
-    buffer = {}
-    end_received = False
-    end_seq_num = None
-
-    while True:
-        pkt, address = s.recvfrom(2048)
-        header, msg = parse_packet(pkt)
-        if header is None:
-            # Checksum mismatch or corrupted packet: drop packet
-            continue
-
-        if state == "LISTENING":
-            if header.type == 0:  # START packet
-                sender_addr = address
-                state = "CONNECTED"
-                expected_seq_num = 1
-                buffer.clear()
-                end_received = False
-                end_seq_num = None
-                # Send ACK for START with seq_num = 1
-                ack_pkt = make_packet(3, 1, b"")
-                s.sendto(ack_pkt, sender_addr)
-            continue
-
-        # In CONNECTED state: ignore START packets or other senders
-        if address != sender_addr:
-            continue
-        if header.type == 0:
-            continue
-
-        if header.type == 2:  # DATA packet
-            seq = header.seq_num
-            # Drop packet if seq_num >= expected_seq_num + window_size
-            if seq >= expected_seq_num + window_size:
-                continue
-
-            if seq < expected_seq_num:
-                # Duplicate packet: send cumulative ACK with current expected_seq_num
-                ack_pkt = make_packet(3, expected_seq_num, b"")
-                s.sendto(ack_pkt, sender_addr)
-            elif seq > expected_seq_num:
-                # Out-of-order packet within window: buffer and send cumulative ACK
-                buffer[seq] = msg
-                ack_pkt = make_packet(3, expected_seq_num, b"")
-                s.sendto(ack_pkt, sender_addr)
-            else:  # seq == expected_seq_num
-                sys.stdout.buffer.write(msg)
-                expected_seq_num += 1
-                while expected_seq_num in buffer:
-                    sys.stdout.buffer.write(buffer.pop(expected_seq_num))
-                    expected_seq_num += 1
-                sys.stdout.buffer.flush()
-
-                ack_pkt = make_packet(3, expected_seq_num, b"")
-                s.sendto(ack_pkt, sender_addr)
-
-                # If END was received earlier and in-order stream reached end_seq_num
-                if end_received and expected_seq_num == end_seq_num:
-                    end_ack = make_packet(3, end_seq_num, b"")
-                    s.sendto(end_ack, sender_addr)
-                    break
-
-        elif header.type == 1:  # END packet
-            if header.seq_num == expected_seq_num:
-                end_ack = make_packet(3, header.seq_num, b"")
-                s.sendto(end_ack, sender_addr)
-                sys.stdout.buffer.flush()
-                break
-            elif header.seq_num > expected_seq_num:
-                end_received = True
-                end_seq_num = header.seq_num
-                ack_pkt = make_packet(3, expected_seq_num, b"")
-                s.sendto(ack_pkt, sender_addr)
-
-    s.close()
+    zen_receiver = ZenBaseReceiver(receiver_ip, receiver_port, window_size)
+    zen_receiver.zc_listen_loop()
 
 
 def main():
